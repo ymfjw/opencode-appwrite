@@ -1,39 +1,77 @@
-package handler
+package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/rand"
+	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"log"
+	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
+	"os/exec"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
-
-	"github.com/open-runtimes/types-for-go/v4/openruntimes"
 )
 
-// 动态生成符合规范的 UUIDv4 伪随机字符，打散单会话配额与轨迹追溯
-func generateRandomUUID() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	b[6] = (b[6] & 0x0f) | 0x40 // Version 4
-	b[8] = (b[8] & 0x3f) | 0x80 // Variant 10
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:])
+const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+
+var (
+	idGenMu       sync.Mutex
+	lastTimestamp int64
+	idCounter     int64
+)
+
+// 严格还原 OpenCode 官方单调 ID 生成算法 (Prefix + 6字节时间戳 + 14位Base62随机串)
+func generateOpenCodeID(prefix string) string {
+	idGenMu.Lock()
+	defer idGenMu.Unlock()
+
+	nowMs := time.Now().UnixMilli()
+	if nowMs != lastTimestamp {
+		lastTimestamp = nowMs
+		idCounter = 0
+	}
+	idCounter++
+
+	// descending 模式按位取反（与官方 TypeScript 实现 100% 一致）
+	now := ^(nowMs*0x1000 + idCounter)
+
+	var timeBytes [6]byte
+	for i := 0; i < 6; i++ {
+		timeBytes[i] = byte((now >> (40 - 8*uint(i))) & 0xff)
+	}
+
+	randBytes := make([]byte, 14)
+	_, _ = rand.Read(randBytes)
+	randomPart := make([]byte, 14)
+	for i := 0; i < 14; i++ {
+		randomPart[i] = base62Alphabet[randBytes[i]%62]
+	}
+
+	return fmt.Sprintf("%s_%x%s", prefix, timeBytes, string(randomPart))
 }
 
 // 模拟最新 Chrome Desktop / VSCode Electron 物理客户端全维度指纹 Header
 func applyClientFingerprint(req *http.Request) {
-	// 1. 重写 User-Agent，覆写默认的 Go-http-client 特征
+	// 1. 重写 User-Agent
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Opencode/1.18.31")
 	
-	// 2. 注入 Client-Hints (Chromium 物理环境指纹)
+	// 2. 注入 Client-Hints
 	req.Header.Set("sec-ch-ua", `"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"`)
 	req.Header.Set("sec-ch-ua-mobile", "?0")
 	req.Header.Set("sec-ch-ua-platform", `"Windows"`)
 	
-	// 3. 注入 Fetch Metadata (跨域与来源伪装)
+	// 3. 注入 Fetch Metadata
 	req.Header.Set("sec-fetch-dest", "empty")
 	req.Header.Set("sec-fetch-mode", "cors")
 	req.Header.Set("sec-fetch-site", "cross-site")
@@ -48,47 +86,171 @@ func applyClientFingerprint(req *http.Request) {
 	req.Header.Set("Origin", "https://opencode.ai")
 	req.Header.Set("Referer", "https://opencode.ai/")
 	
-	// 6. 动态伪造独立 Session ID 与 Request ID，彻底隔离每笔请求的指纹追踪
-	rawUUID := strings.ReplaceAll(generateRandomUUID(), "-", "")
-	if len(rawUUID) > 24 {
-		rawUUID = rawUUID[:24]
-	}
-	sessionID := "ses_" + rawUUID
-	reqID := generateRandomUUID()
+	// 6. 注入合规的动态 Session ID 与 Request ID
+	sessionID := generateOpenCodeID("ses")
+	reqID := generateOpenCodeID("req")
 	req.Header.Set("x-opencode-session", sessionID)
-	req.Header.Set("x-opencode-session-id", sessionID)
-	req.Header.Set("x-session-id", sessionID)
 	req.Header.Set("x-request-id", reqID)
-	req.Header.Set("x-correlation-id", reqID)
 }
 
-// 动态生成 Replacer，根据请求的模型区分要替换的名称
+//go:embed public/*
+var publicFiles embed.FS
+
+// ----------------------------------------------------
+// 双活 Worker 与 429 故障自愈重试逻辑
+// ----------------------------------------------------
+
+type Worker struct {
+	URL      *url.URL
+	IsDown   bool
+	LastFail time.Time
+	mu       sync.Mutex
+}
+
+func (w *Worker) markDirtyAndRestart() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.IsDown && time.Since(w.LastFail) < 30*time.Second {
+		return
+	}
+	w.IsDown = true
+	w.LastFail = time.Now()
+
+	if w.URL.Hostname() == "opencode.ai" || w.URL.Scheme == "https" {
+		go func() {
+			log.Printf("[直连模式] 远程 Worker %s 响应异常/429，标记临时冷却 5 秒...", w.URL.String())
+			time.Sleep(5 * time.Second)
+			w.mu.Lock()
+			w.IsDown = false
+			w.mu.Unlock()
+		}()
+		return
+	}
+
+	go func() {
+		log.Printf("[后台自愈] Worker %s 遇到 429 限制，触发重启刷新 Device Token...", w.URL.String())
+		port := w.URL.Port()
+		if port == "" {
+			port = "80"
+		}
+		cmd := exec.Command("bash", "/app/restart_worker.sh", port)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			log.Printf("[后台自愈] Worker %s 重启脚本执行异常: %v", w.URL.String(), err)
+		}
+		
+		time.Sleep(15 * time.Second)
+		
+		w.mu.Lock()
+		w.IsDown = false
+		w.mu.Unlock()
+		log.Printf("[后台自愈] Worker %s 刷新完成，重新加入可用队列", w.URL.String())
+	}()
+}
+
+type RetryTransport struct {
+	Transport http.RoundTripper
+	Workers   []*Worker
+	Next      uint32
+}
+
+func (t *RetryTransport) getNextWorker() *Worker {
+	for i := 0; i < len(t.Workers); i++ {
+		idx := atomic.AddUint32(&t.Next, 1) % uint32(len(t.Workers))
+		w := t.Workers[idx]
+		w.mu.Lock()
+		isDown := w.IsDown
+		w.mu.Unlock()
+		if !isDown {
+			return w
+		}
+	}
+	return t.Workers[0]
+}
+
+func (t *RetryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	var bodyBytes []byte
+	if req.Body != nil {
+		bodyBytes, _ = io.ReadAll(req.Body)
+		req.Body.Close()
+	}
+
+	maxRetries := len(t.Workers)
+	var lastErr error
+	var lastResp *http.Response
+
+	for i := 0; i < maxRetries; i++ {
+		w := t.getNextWorker()
+
+		clonedReq := req.Clone(req.Context())
+		clonedReq.URL.Scheme = w.URL.Scheme
+		clonedReq.URL.Host = w.URL.Host
+
+		// 动态路径修正：官方上游真实路径为 /zen/v1/...
+		if strings.HasPrefix(clonedReq.URL.Path, "/v1/") {
+			clonedReq.URL.Path = "/zen" + clonedReq.URL.Path
+		}
+
+		if strings.Contains(w.URL.Host, "opencode.ai") {
+			clonedReq.Header.Set("Authorization", "Bearer public")
+		}
+
+		if bodyBytes != nil {
+			clonedReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+		}
+
+		resp, err := t.Transport.RoundTrip(clonedReq)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(req.Context().Err(), context.Canceled) {
+				return nil, err
+			}
+			log.Printf("请求 Worker %s 发生网络错误: %v", w.URL.String(), err)
+			lastErr = err
+			w.markDirtyAndRestart()
+			continue
+		}
+
+		if resp.StatusCode == 429 {
+			log.Printf("Worker %s 返回 429 FreeUsageLimitError，触发切换机制", w.URL.String())
+			lastResp = resp
+			w.markDirtyAndRestart()
+			if i < maxRetries-1 {
+				resp.Body.Close()
+				continue
+			}
+			return resp, nil
+		}
+
+		return resp, nil
+	}
+
+	if lastResp != nil {
+		return lastResp, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("all workers failed or returned 429")
+}
+
+// ----------------------------------------------------
+
 func getReplacer(requestedModel string) *strings.Replacer {
-	if requestedModel == "hy3" {
-		return strings.NewReplacer("hy3-free", "hy3")
-	} else if requestedModel == "mimo-v2.5-pro" {
-		return strings.NewReplacer(
-			"mimo-v2.5-free", "mimo-v2.5-pro",
-			"deepseek-v4-flash-free", "deepseek-v4-flash",
-			"hy3-free", "hy3",
-			"系统指令", "身份设定",
-			"系统提示词", "角色设定",
-			"系统提示", "背景设定",
-			"提示词", "自我认知",
-			"指令要求", "设定需要",
-			"系统设定要求", "身份设定需要",
-		)
-	} else if requestedModel == "mimo-v2.5" {
-		return strings.NewReplacer(
-			"mimo-v2.5-free", "mimo-v2.5",
-			"deepseek-v4-flash-free", "deepseek-v4-flash",
-			"hy3-free", "hy3",
-		)
+	if requestedModel == "" {
+		requestedModel = "deepseek-v4-flash"
 	}
 	return strings.NewReplacer(
-		"hy3-free", "hy3",
-		"deepseek-v4-flash-free", "deepseek-v4-flash",
-		"mimo-v2.5-free", "mimo-v2.5",
+		"mimo-v2.5-free", requestedModel,
+		"ling-3.0-flash-fin-free", requestedModel,
+		"hy3-free", requestedModel,
+		"deepseek-v4-flash-free", requestedModel,
+		"系统指令", "身份设定",
+		"系统提示词", "角色设定",
+		"系统提示", "背景设定",
+		"提示词", "自我认知",
+		"指令要求", "设定需要",
+		"系统设定要求", "身份设定需要",
 	)
 }
 
@@ -99,56 +261,221 @@ func getInjectionPrompt(model string) string {
 	return ""
 }
 
-// 获取上游端点列表（支持环境变量 WORKERS / UPSTREAM 动态配置与备用池）
-func getUpstreamHosts() []string {
-	envWorkers := os.Getenv("WORKERS")
-	if envWorkers == "" {
-		envWorkers = os.Getenv("UPSTREAM")
+var (
+	logMutex sync.Mutex
+	callLogs []string
+)
+
+func addLog(msg string) {
+	logMutex.Lock()
+	defer logMutex.Unlock()
+	callLogs = append(callLogs, msg)
+	if len(callLogs) > 500 {
+		callLogs = callLogs[len(callLogs)-500:]
 	}
-	if envWorkers == "" {
-		return []string{"https://opencode.ai"}
-	}
-	parts := strings.Split(envWorkers, ",")
-	var hosts []string
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			if !strings.HasPrefix(p, "http://") && !strings.HasPrefix(p, "https://") {
-				p = "https://" + p
-			}
-			hosts = append(hosts, strings.TrimRight(p, "/"))
-		}
-	}
-	if len(hosts) == 0 {
-		return []string{"https://opencode.ai"}
-	}
-	return hosts
 }
 
-// Main 是 Appwrite Cloud Go 函数的唯一合法入口点
-func Main(Context openruntimes.Context) openruntimes.Response {
-	corsHeaders := map[string]string{
-		"Access-Control-Allow-Origin":  "*",
-		"Access-Control-Allow-Methods": "POST, GET, OPTIONS, PUT, DELETE",
-		"Access-Control-Allow-Headers": "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, x-api-key",
+// 实时流式替换 Reader
+type replacingReadCloser struct {
+	src      io.ReadCloser
+	buf      []byte
+	done     bool
+	replacer *strings.Replacer
+}
+
+func (r *replacingReadCloser) Read(p []byte) (int, error) {
+	if r.done && len(r.buf) == 0 {
+		return 0, io.EOF
 	}
 
-	// 1. 处理预检请求 (CORS OPTIONS)
-	if Context.Req.Method == "OPTIONS" || Context.Req.Method == "options" {
-		return Context.Res.Text("", Context.Res.WithStatusCode(200), Context.Res.WithHeaders(corsHeaders))
+	if len(r.buf) > 0 {
+		n := copy(p, r.buf)
+		r.buf = r.buf[n:]
+		return n, nil
 	}
 
-	// 2. 安全鉴权拦截 (Appwrite Header 键名均小写)
-	authHeader := Context.Req.Headers["authorization"]
-	apiKey := Context.Req.Headers["x-api-key"]
-	if authHeader != "Bearer sk-mimo" && apiKey != "sk-mimo" {
-		return Context.Res.Text("Unauthorized: Invalid API Key", Context.Res.WithStatusCode(401), Context.Res.WithHeaders(corsHeaders))
+	tmp := make([]byte, len(p))
+	n, err := r.src.Read(tmp)
+	if err == io.EOF {
+		r.done = true
+	} else if err != nil {
+		return 0, err
 	}
 
-	// 3. 模型列表查询接口拦截 (/v1/models)
-	path := Context.Req.Path
-	if strings.HasSuffix(path, "/models") || strings.HasSuffix(path, "/v1/models") {
-		modelsData := map[string]interface{}{
+	if n > 0 {
+		replaced := r.replacer.Replace(string(tmp[:n]))
+		copied := copy(p, replaced)
+		if copied < len(replaced) {
+			r.buf = []byte(replaced[copied:])
+		}
+		return copied, nil
+	}
+	return 0, io.EOF
+}
+
+func (r *replacingReadCloser) Close() error {
+	return r.src.Close()
+}
+
+func main() {
+	subFS, err := fs.Sub(publicFiles, "public")
+	if err != nil {
+		log.Fatalf("无法加载内嵌的静态文件系统: %v", err)
+	}
+	fsHandler := http.FileServer(http.FS(subFS))
+
+	workerStrs := os.Getenv("WORKERS")
+	var workers []*Worker
+	if workerStrs == "" {
+		workerStrs = "https://opencode.ai"
+		log.Printf("未检测到 WORKERS 环境变量，采用单点直连模式: https://opencode.ai")
+	}
+
+	urls := strings.Split(workerStrs, ",")
+	for _, uStr := range urls {
+		uStr = strings.TrimSpace(uStr)
+		if uStr != "" {
+			u, err := url.Parse(uStr)
+			if err == nil {
+				workers = append(workers, &Worker{URL: u})
+			}
+		}
+	}
+	log.Printf("启用了双活/多活 Worker 模式，共有 %d 个节点待命", len(workers))
+
+	proxy := httputil.NewSingleHostReverseProxy(workers[0].URL)
+	proxy.Transport = &RetryTransport{
+		Transport: http.DefaultTransport,
+		Workers:   workers,
+	}
+	
+	originalDirector := proxy.Director
+
+	proxy.Director = func(req *http.Request) {
+		originalDirector(req)
+		
+		requestedModel := "unknown"
+		
+		if req.Method == "POST" && req.Body != nil {
+			bodyBytes, err := io.ReadAll(req.Body)
+			if err == nil {
+				var reqData map[string]interface{}
+				if err := json.Unmarshal(bodyBytes, &reqData); err == nil {
+					if model, ok := reqData["model"].(string); ok {
+						requestedModel = model
+						modified := false
+						
+						injectPrompt := getInjectionPrompt(model)
+						if injectPrompt != "" {
+							if messages, ok := reqData["messages"].([]interface{}); ok && len(messages) > 0 {
+								hasSystem := false
+								if firstMsg, ok := messages[0].(map[string]interface{}); ok {
+									role, _ := firstMsg["role"].(string)
+									if role == "system" {
+										hasSystem = true
+										content, _ := firstMsg["content"].(string)
+										firstMsg["content"] = injectPrompt + "\n" + content
+									}
+								}
+								if !hasSystem {
+									newSystemMsg := map[string]interface{}{
+										"role":    "system",
+										"content": injectPrompt,
+									}
+									reqData["messages"] = append([]interface{}{newSystemMsg}, messages...)
+								}
+								modified = true
+							}
+						}
+
+						modelLower := strings.ToLower(model)
+						if strings.HasPrefix(modelLower, "ling") {
+							reqData["model"] = "ling-3.0-flash-fin-free"
+							modified = true
+						} else {
+							// 默认统一智能路由到当前最稳定高速的 mimo-v2.5-free
+							reqData["model"] = "mimo-v2.5-free"
+							modified = true
+						}
+						
+						if modified {
+							newBodyBytes, _ := json.Marshal(reqData)
+							req.Body = io.NopCloser(bytes.NewBuffer(newBodyBytes))
+							req.ContentLength = int64(len(newBodyBytes))
+							req.Header.Set("Content-Length", fmt.Sprint(len(newBodyBytes)))
+						} else {
+							req.Header.Set("Content-Length", fmt.Sprint(len(bodyBytes)))
+							req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+						}
+					} else {
+						req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+					}
+				} else {
+					req.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+				}
+			}
+		}
+
+		req.Host = "opencode.ai"
+		req.Header.Set("Authorization", "Bearer public")
+		
+		applyClientFingerprint(req)
+		
+		if requestedModel != "unknown" {
+			addLog(fmt.Sprintf("[%s] 请求 %s -> ☁️ 分配至 OpenCode 渠道", time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02 15:04:05"), requestedModel))
+			req.Header.Set("X-Requested-Model", requestedModel)
+		}
+		
+		req.Header.Del("Accept-Encoding")
+	}
+
+	proxy.ModifyResponse = func(resp *http.Response) error {
+		reqModel := resp.Request.Header.Get("X-Requested-Model")
+		replacer := getReplacer(reqModel)
+		
+		contentType := resp.Header.Get("Content-Type")
+		if strings.Contains(contentType, "text/event-stream") {
+			resp.Body = &replacingReadCloser{src: resp.Body, replacer: replacer}
+			resp.Header.Del("Content-Length")
+			resp.ContentLength = -1
+		} else {
+			if resp.Body != nil {
+				bodyBytes, err := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if err == nil {
+					replaced := replacer.Replace(string(bodyBytes))
+					newBytes := []byte(replaced)
+					resp.Body = io.NopCloser(bytes.NewReader(newBytes))
+					resp.ContentLength = int64(len(newBytes))
+					resp.Header.Set("Content-Length", fmt.Sprint(len(newBytes)))
+				}
+			}
+		}
+		return nil
+	}
+
+	corsMiddleware := func(next http.HandlerFunc) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+			w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, x-api-key")
+
+			if r.Method == "OPTIONS" {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			authHeader := r.Header.Get("Authorization")
+			apiKey := r.Header.Get("x-api-key")
+			if authHeader != "Bearer sk-mimo" && apiKey != "sk-mimo" {
+				http.Error(w, "Unauthorized: Invalid API Key", http.StatusUnauthorized)
+				return
+			}
+			next.ServeHTTP(w, r)
+		}
+	}
+
+	modelsHandler := func(w http.ResponseWriter, r *http.Request) {
+		resData := map[string]interface{}{
 			"object": "list",
 			"data": []map[string]interface{}{
 				{"id": "hy3", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
@@ -159,154 +486,60 @@ func Main(Context openruntimes.Context) openruntimes.Response {
 				{"id": "deepseek-r1", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
 				{"id": "mimo-v2.5-pro", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
 				{"id": "mimo-v2.5", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
+				{"id": "ling-3.0", "object": "model", "created": time.Now().Unix(), "owned_by": "mimo"},
 			},
 		}
-		return Context.Res.Json(modelsData, Context.Res.WithStatusCode(200), Context.Res.WithHeaders(corsHeaders))
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(resData)
 	}
 
-	// 4. 解析与重写请求负载 (处理人设注入及 V4 完全体与 hy3 映射)
-	requestedModel := "unknown"
-	bodyBytes := Context.Req.BodyBinary()
-	var reqData map[string]interface{}
-	modified := false
-
-	if len(bodyBytes) > 0 {
-		if err := json.Unmarshal(bodyBytes, &reqData); err == nil {
-			if model, ok := reqData["model"].(string); ok {
-				requestedModel = model
-				injectPrompt := getInjectionPrompt(model)
-				if injectPrompt != "" {
-					if messages, ok := reqData["messages"].([]interface{}); ok && len(messages) > 0 {
-						hasSystem := false
-						if firstMsg, ok := messages[0].(map[string]interface{}); ok {
-							role, _ := firstMsg["role"].(string)
-							if role == "system" {
-								hasSystem = true
-								content, _ := firstMsg["content"].(string)
-								firstMsg["content"] = injectPrompt + "\n" + content
-							}
-						}
-						if !hasSystem {
-							newSystemMsg := map[string]interface{}{
-								"role":    "system",
-								"content": injectPrompt,
-							}
-							reqData["messages"] = append([]interface{}{newSystemMsg}, messages...)
-						}
-						modified = true
-					}
-				}
-
-				modelLower := strings.ToLower(model)
-				if modelLower == "hy3" {
-					reqData["model"] = "hy3-free"
-					modified = true
-				} else if strings.HasPrefix(modelLower, "deepseek") {
-					reqData["model"] = "deepseek-v4-flash-free"
-					modified = true
-				} else if strings.HasPrefix(modelLower, "mimo") {
-					reqData["model"] = "mimo-v2.5-free"
-					modified = true
-				}
-
-				if modified {
-					newBodyBytes, _ := json.Marshal(reqData)
-					bodyBytes = newBodyBytes
-				}
-			}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/models", corsMiddleware(modelsHandler))
+	mux.HandleFunc("/v1/", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		proxy.ServeHTTP(w, r)
+	}))
+	mux.HandleFunc("/api", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		urlData, err := os.ReadFile("/tmp/tunnel.url")
+		if err != nil {
+			w.Write([]byte("Tunnel URL is not ready yet. Please refresh in a few seconds..."))
+			return
 		}
-	}
-
-	// 5. 构造路径
-	targetPath := path
-	if strings.HasPrefix(targetPath, "/v1/") {
-		targetPath = "/zen" + targetPath
-	} else if !strings.HasPrefix(targetPath, "/zen/") {
-		targetPath = "/zen/v1/chat/completions"
-	}
-
-	upstreams := getUpstreamHosts()
-	client := &http.Client{Timeout: 55 * time.Second}
-
-	var resp *http.Response
-	var lastErr error
-	var rawRespBytes []byte
-
-	// 6. 支持多上游轮询与 429 智能重试机制 (最多尝试 2 次)
-	for attempt := 0; attempt < 2; attempt++ {
-		for _, upstreamBase := range upstreams {
-			targetURL := upstreamBase + targetPath
-
-			req, err := http.NewRequest("POST", targetURL, bytes.NewReader(bodyBytes))
-			if err != nil {
-				lastErr = err
-				continue
-			}
-
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("Authorization", "Bearer public")
-			
-			// 每次重试都注入全新独立 UUID，消除上一轮请求的关联轨迹
-			applyClientFingerprint(req)
-			
-			req.ContentLength = int64(len(bodyBytes))
-			req.Header.Set("Content-Length", fmt.Sprint(len(bodyBytes)))
-			req.Header.Del("Accept-Encoding")
-
-			resp, err = client.Do(req)
-			if err != nil {
-				lastErr = err
-				continue
-			}
-
-			// 如果命中 429 频控，记录日志并尝试下一个节点或带随机 UUID 重试
-			if resp.StatusCode == 429 {
-				resp.Body.Close()
-				lastErr = fmt.Errorf("upstream returned 429 Too Many Requests from %s", upstreamBase)
-				time.Sleep(300 * time.Millisecond) // 短暂退避
-				continue
-			}
-
-			rawRespBytes, err = io.ReadAll(resp.Body)
-			resp.Body.Close()
-			if err != nil {
-				lastErr = err
-				continue
-			}
-
-			// 成功获得非 429 响应，跳出重试循环
-			lastErr = nil
-			break
+		w.Write(urlData)
+	})
+	
+	mux.HandleFunc("/log", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		logMutex.Lock()
+		defer logMutex.Unlock()
+		if len(callLogs) == 0 {
+			w.Write([]byte("暂无调用记录。\n"))
+			return
 		}
-
-		if lastErr == nil && resp != nil && resp.StatusCode != 429 {
-			break
+		var buf bytes.Buffer
+		buf.WriteString("=====================================\n")
+		buf.WriteString("       OpenCodeFree 代理网关路由日志     \n")
+		buf.WriteString("=====================================\n")
+		for i := len(callLogs) - 1; i >= 0; i-- {
+			buf.WriteString(callLogs[i] + "\n")
 		}
-	}
+		w.Write(buf.Bytes())
+	})
+	
+	mux.Handle("/", fsHandler)
 
-	if lastErr != nil && (resp == nil || resp.StatusCode == 429) {
-		Context.Log("All upstreams failed or hit 429 rate limit: " + lastErr.Error())
-		errorJson := fmt.Sprintf(`{"error":{"message":"上游 OpenCode 频控限制 (429 Too Many Requests)。建议稍后重试或在 Appwrite 环境变量中配置 WORKERS 代理池。","type":"rate_limit_error","code":429}}`)
-		return Context.Res.Text(errorJson, Context.Res.WithStatusCode(429), Context.Res.WithHeaders(map[string]string{
-			"Content-Type": "application/json",
-			"Access-Control-Allow-Origin": "*",
-		}))
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
 	}
-
-	// 7. 响应拦截与准确全量字节替换
-	replacer := getReplacer(requestedModel)
-	replacedStr := replacer.Replace(string(rawRespBytes))
-	finalBytes := []byte(replacedStr)
-
-	respHeaders := make(map[string]string)
-	for k, v := range corsHeaders {
-		respHeaders[k] = v
+	ip := os.Getenv("IP")
+	if ip == "" {
+		ip = "0.0.0.0"
 	}
-	if ct := resp.Header.Get("Content-Type"); ct != "" {
-		respHeaders["Content-Type"] = ct
-	} else {
-		respHeaders["Content-Type"] = "application/json"
-	}
+	bindAddr := net.JoinHostPort(ip, port)
 
-	return Context.Res.Binary(finalBytes, Context.Res.WithStatusCode(resp.StatusCode), Context.Res.WithHeaders(respHeaders))
-}\n
+	log.Printf("OpenCode 代理网关已启动，监听地址 %s...", bindAddr)
+	if err := http.ListenAndServe(bindAddr, mux); err != nil {
+		log.Fatalf("网关启动失败: %v", err)
+	}
+}
